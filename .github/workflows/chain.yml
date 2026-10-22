@@ -1,0 +1,135 @@
+name: chain-timer
+
+# 自接力定时器：一个常驻运行，到点触发私有仓库任务，运行到 5 小时后自动接力下一个运行。
+# 不依赖 GitHub 的 schedule（当前不触发），也不需要任何外部服务账号。
+on:
+  workflow_dispatch:
+    inputs:
+      handoff:
+        description: "接力序号（内部使用）"
+        required: false
+        default: "0"
+      test:
+        description: "1 = 启动后 90 秒先做一次链路实测"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chain-timer
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    steps:
+      - name: 常驻循环
+        env:
+          PAT: ${{ secrets.DISPATCH_PAT }}
+          HANDOFF: ${{ github.event.inputs.handoff }}
+          TEST: ${{ github.event.inputs.test }}
+        run: |
+          python3 - <<'PY'
+          import datetime as dt
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+
+          PAT = (os.environ.get("PAT") or "").strip()
+          OWNER = "Relax4141"
+          PRIV = "---"
+          PUBLIC = "wb-cron"
+
+          # (UTC 小时, 分, 目标工作流)  —— 北京 07:00 / 09:00 / 12:00 / 23:30
+          SLOTS = [
+              (23, 0, "workbuddy.yml"),
+              (1, 0, "xhs-daily.yml"),
+              (4, 0, "workbuddy.yml"),
+              (15, 30, "workbuddy.yml"),
+          ]
+          # 北京时间对照，仅用于日志
+          BJ = {23: "07:00", 1: "09:00", 4: "12:00", 15: "23:30"}
+
+          HANDOFF_AFTER = 5 * 3600 + 300     # 运行 5h05m 后接力下一个
+          WINDOW = 180                       # 触发窗口 ±3 分钟
+          API = "https://api.github.com"
+
+          def dispatch(repo, wf, inputs=None):
+              payload = {"ref": "main"}
+              if inputs:
+                  payload["inputs"] = inputs
+              data = json.dumps(payload).encode()
+              for attempt in range(1, 4):
+                  req = urllib.request.Request(
+                      f"{API}/repos/{repo}/actions/workflows/{wf}/dispatches",
+                      data=data, method="POST")
+                  req.add_header("Authorization", "Bearer " + PAT)
+                  req.add_header("Accept", "application/vnd.github+json")
+                  req.add_header("Content-Type", "application/json")
+                  req.add_header("User-Agent", "wb-chain-timer")
+                  try:
+                      with urllib.request.urlopen(req, timeout=45) as r:
+                          return r.status, None
+                  except urllib.error.HTTPError as e:
+                      body = e.read().decode("utf-8", "replace")[:200]
+                      err = f"HTTP {e.code} {body}"
+                  except Exception as e:  # noqa: BLE001
+                      err = repr(e)[:200]
+                  print(f"[retry] {repo}/{wf} 第{attempt}次失败：{err}", flush=True)
+                  time.sleep(8)
+              return None, err
+
+          print(f"[start] {dt.datetime.now(dt.timezone.utc):%F %T} UTC | handoff={os.environ.get('HANDOFF')}", flush=True)
+
+          started = time.time()
+          fired = set()
+          last_beat = 0.0
+          test_done = False
+
+          while True:
+              now = dt.datetime.now(dt.timezone.utc)
+              day = now.date().isoformat()
+
+              # 启动后的链路实测（一次性）
+              if not test_done:
+                  if os.environ.get("TEST") == "1" and time.time() - started >= 90:
+                      code, err = dispatch(f"{OWNER}/{PRIV}", "xhs-daily.yml")
+                      print(f"[test] 链路实测 dispatch xhs-daily.yml -> status={code} err={err}", flush=True)
+                      test_done = True
+                  elif os.environ.get("TEST") != "1":
+                      test_done = True
+
+              # 到点触发
+              for h, m, wf in SLOTS:
+                  slot = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                  delta = (now - slot).total_seconds()
+                  key = (day, h, m)
+                  if 0 <= delta < WINDOW and key not in fired:
+                      code, err = dispatch(f"{OWNER}/{PRIV}", wf)
+                      print(f"[fire] {now:%F %T} UTC -> {wf} (北京 {BJ[h]}) status={code} err={err}", flush=True)
+                      if code and 200 <= code < 300:
+                          fired.add(key)
+
+              # 心跳
+              if time.time() - last_beat > 1800:
+                  print(f"[alive] {now:%F %T} UTC | 已运行 {int((time.time()-started)//60)} 分钟", flush=True)
+                  last_beat = time.time()
+
+              # 接力
+              if time.time() - started > HANDOFF_AFTER:
+                  seq = int(os.environ.get("HANDOFF") or 0) + 1
+                  code, err = dispatch(f"{OWNER}/{PUBLIC}", "chain.yml", {"handoff": str(seq)})
+                  if code and 200 <= code < 300:
+                      print(f"[handoff] seq={seq} 已接力下一个运行，本次退出", flush=True)
+                      break
+                  print(f"[handoff] 接力失败（将重试）：{err}", flush=True)
+
+              time.sleep(30)
+
+          print("[exit] 本次运行结束", flush=True)
+          PY
