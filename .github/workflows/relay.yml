@@ -1,0 +1,40 @@
+name: relay
+# 公开仓库里当“定时器”，到点用 API 触发私有仓库的任务。
+# 原因：GitHub 免费账号 + 私有仓库的组合下，schedule 触发被平台禁用（手动 dispatch 正常）。
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # 临时：验证调度是否生效（会自动跳过非目标时间档）
+    - cron: "0 23 * * *"    # 北京 07:00 → 签到
+    - cron: "0 1 * * *"     # 北京 09:00 → 小红书日更
+    - cron: "0 4 * * *"     # 北京 12:00 → 签到
+    - cron: "30 15 * * *"   # 北京 23:30 → 签到
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 按北京时间分发
+        env:
+          PAT: ${{ secrets.DISPATCH_PAT }}
+        run: |
+          set -e
+          H=$(TZ=Asia/Shanghai date +%H)
+          echo "北京时间 $(TZ=Asia/Shanghai date '+%F %H:%M')  小时=$H"
+          if [ -z "$PAT" ]; then echo "缺少 DISPATCH_PAT，退出"; exit 1; fi
+          api() {
+            curl -sS -X POST \
+              -H "Authorization: Bearer $PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/Relax4141/---/actions/workflows/$1/dispatches" \
+              -d '{"ref":"main"}' -o /dev/null -w "→ dispatch $1  HTTP %{http_code}\n"
+          }
+          case "$H" in
+            07|12|23) api workbuddy.yml ;;
+            09)       api xhs-daily.yml ;;
+            *)        echo "非目标时间档，跳过" ;;
+          esac
