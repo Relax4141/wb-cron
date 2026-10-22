@@ -35,5 +35,12 @@ jobs:
           case "$H" in
             07|12|23) api workbuddy.yml ;;
             09)       api xhs-daily.yml ;;
-            *)        echo "非目标时间档，跳过" ;;
+            *)
+              if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+                echo "手动测试模式：分发小红书日更以验证链路"
+                api xhs-daily.yml
+              else
+                echo "非目标时间档，跳过"
+              fi
+              ;;
           esac
